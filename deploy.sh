@@ -18,6 +18,14 @@ echo "Port: $PORT"
 echo "Script dir: $SCRIPT_DIR"
 echo "=========================================="
 
+# 0. Git pull (update kode dari repo)
+if [ -d "$SCRIPT_DIR/.git" ]; then
+  echo "[0/7] Git pull..."
+  (cd "$SCRIPT_DIR" && git pull) || echo "    Skip/warning: git pull gagal atau bukan repo."
+else
+  echo "[0/7] Bukan git repo, skip git pull."
+fi
+
 # 1. Cek root/sudo untuk install sistem
 need_sudo=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -25,7 +33,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 2. Install dependensi sistem (Ubuntu/Debian)
-echo "[1/6] Memeriksa dependensi sistem..."
+echo "[1/7] Memeriksa dependensi sistem..."
 if command -v apt-get &>/dev/null; then
   $need_sudo apt-get update -qq
   $need_sudo apt-get install -y -qq \
@@ -42,8 +50,8 @@ else
   echo "    Skip apt (bukan Debian/Ubuntu). Pastikan Python3, OpenCV libs, dan Tesseract terpasang."
 fi
 
-# 3. Buat direktori target dan salin file
-echo "[2/6] Menyiapkan direktori $TARGET_DIR..."
+# 3. Buat direktori target dan salin file (update script)
+echo "[2/7] Menyiapkan direktori $TARGET_DIR..."
 $need_sudo mkdir -p "$TARGET_DIR"
 $need_sudo chown "$(whoami):$(id -gn)" "$TARGET_DIR" 2>/dev/null || true
 
@@ -62,18 +70,21 @@ done
 cd "$TARGET_DIR"
 
 # 4. Virtual environment dan dependensi Python
-echo "[3/6] Membuat virtual environment..."
-python3 -m venv .venv
+echo "[3/7] Virtual environment..."
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+  echo "    .venv baru dibuat."
+fi
 source .venv/bin/activate
 
-echo "[4/6] Menginstall dependensi Python..."
+echo "[4/7] Menginstall dependensi Python..."
 pip install --upgrade pip -q
 pip install -r requirements.txt
 # Wajib untuk FastAPI form/upload (File, UploadFile)
 pip install -q python-multipart
 
 # 5. Cek file wajib
-echo "[5/6] Memeriksa file wajib..."
+echo "[5/7] Memeriksa file wajib..."
 missing=""
 [ ! -f "validate.py" ] && missing="validate.py"
 [ ! -f "model.keras" ] && missing="${missing:+$missing }model.keras"
@@ -83,7 +94,7 @@ if [ -n "$missing" ]; then
 fi
 
 # 6. Systemd service (opsional)
-echo "[6/6] Membuat unit systemd (opsional)..."
+echo "[6/7] Membuat unit systemd (opsional)..."
 SERVICE_FILE="/etc/systemd/system/face-api.service"
 if [ -w "/etc/systemd/system" ] 2>/dev/null || $need_sudo test -w "/etc/systemd/system" 2>/dev/null; then
   cat << EOF | $need_sudo tee "$SERVICE_FILE" > /dev/null
@@ -108,6 +119,19 @@ EOF
 else
   echo "    Skip systemd (no write access). Jalankan manual:"
   echo "    cd $TARGET_DIR && .venv/bin/uvicorn validate:app --host 0.0.0.0 --port $PORT"
+fi
+
+# 7. Reload service (restart face-api)
+echo "[7/7] Reload service..."
+if systemctl is-active --quiet face-api 2>/dev/null; then
+  $need_sudo systemctl daemon-reload
+  $need_sudo systemctl restart face-api
+  echo "    face-api di-restart."
+elif [ -f "$SERVICE_FILE" ]; then
+  $need_sudo systemctl daemon-reload
+  $need_sudo systemctl restart face-api 2>/dev/null && echo "    face-api di-restart." || echo "    Service belum aktif. Jalankan: sudo systemctl start face-api"
+else
+  echo "    Service face-api tidak jalan. Untuk jalankan: sudo systemctl start face-api"
 fi
 
 echo ""
