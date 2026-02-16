@@ -69,6 +69,8 @@ source .venv/bin/activate
 echo "[4/6] Menginstall dependensi Python..."
 pip install --upgrade pip -q
 pip install -r requirements.txt
+# Wajib untuk FastAPI form/upload (File, UploadFile)
+pip install -q python-multipart
 
 # 5. Cek file wajib
 echo "[5/6] Memeriksa file wajib..."
