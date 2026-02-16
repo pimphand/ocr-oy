@@ -468,7 +468,7 @@ async def predict_face(file: UploadFile = File(...)):
     # 'is_human' and 'is_face_human' are redundant but included as per request.
     return {
         "is_human": is_human_label, 
-        "face_found": face_count == 1, 
+        "face_found": face_count, 
         "is_face_human": is_human_label, 
         "success": success
     }
