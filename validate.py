@@ -9,7 +9,18 @@ import uvicorn
 # OCR untuk KTP (opsional: butuh pytesseract + Tesseract terpasang)
 try:
     import pytesseract
+    import shutil
     OCR_AVAILABLE = True
+    # Pastikan binary tesseract pakai path absolut (penting di server/systemd dengan PATH terbatas)
+    _tesseract_cmd = None
+    for path in ("/usr/bin/tesseract", "/usr/local/bin/tesseract"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            _tesseract_cmd = path
+            break
+    if not _tesseract_cmd:
+        _tesseract_cmd = shutil.which("tesseract")
+    if _tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
 except ImportError:
     pytesseract = None
     OCR_AVAILABLE = False
@@ -141,7 +152,12 @@ def ocr_ktp_image(image_np):
                 best_score = score
                 best_text = text
     if not best_text:
-        return "", None  # kembalikan string kosong, jangan error
+        # Cek apakah Tesseract benar-benar ada (di server PATH terbatas bisa tidak ketemu)
+        try:
+            pytesseract.get_tesseract_version()
+        except Exception as e:
+            return None, f"Tesseract tidak ditemukan di server: {e}. Pasang: apt install tesseract-ocr tesseract-ocr-ind dan pastikan PATH menyertakan /usr/bin."
+        return "", None  # teks kosong tapi Tesseract jalan (gambar tidak terbaca)
     return best_text, None
 
 

@@ -106,7 +106,7 @@ After=network.target
 Type=simple
 User=$APP_USER
 WorkingDirectory=$TARGET_DIR
-Environment="PATH=$TARGET_DIR/.venv/bin"
+Environment="PATH=$TARGET_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=$TARGET_DIR/.venv/bin/uvicorn validate:app --host 0.0.0.0 --port $PORT
 Restart=on-failure
 RestartSec=5
