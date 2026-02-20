@@ -3,8 +3,16 @@ import numpy as np
 import tensorflow as tf
 import os
 import re
+import asyncio
 from fastapi import FastAPI, File, UploadFile, Response
 import uvicorn
+
+# Batasi penggunaan CPU: TensorFlow tidak pakai semua core
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+except Exception:
+    pass
 
 # OCR untuk KTP (opsional: butuh pytesseract + Tesseract terpasang)
 try:
@@ -49,41 +57,43 @@ IMG_HEIGHT = 128
 IMG_WIDTH = 128
 print(f"Image dimensions set to {IMG_WIDTH}x{IMG_HEIGHT}.")
 
+# Ukuran maks gambar untuk deteksi wajah (ringankan CPU)
+FACE_DETECT_MAX_DIM = 640
+
 # 4. Create a helper function for face detection and classification
 def detect_and_classify_face(image_np, face_classifier, classifier_model, img_height, img_width):
     face_count = 0
     is_face_human = None
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
-    
-    # Perform face detection
+    h_orig, w_orig = image_np.shape[:2]
+    # Downscale untuk deteksi wajah agar CPU tidak berat
+    scale = 1.0
+    if max(h_orig, w_orig) > FACE_DETECT_MAX_DIM:
+        scale = FACE_DETECT_MAX_DIM / max(h_orig, w_orig)
+        small = cv2.resize(image_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        small = image_np
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     faces = face_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    
     face_count = len(faces)
-    
     if face_count == 1:
         (x, y, w, h) = faces[0]
-        cropped_face = image_np[y:y+h, x:x+w]
-        
-        # Resize and normalize
+        if scale < 1.0:
+            x, y, w, h = int(x / scale), int(y / scale), int(w / scale), int(h / scale)
+            x, y = max(0, x), max(0, y)
+            w, h = min(w_orig - x, w), min(h_orig - y, h)
+        cropped_face = image_np[y : y + h, x : x + w]
         cropped_face_resized = cv2.resize(cropped_face, (img_width, img_height))
         normalized_face = cropped_face_resized / 255.0
-        
-        # Expand dimensions for model prediction (batch of 1)
         input_image = np.expand_dims(normalized_face, axis=0)
-        
-        # Get prediction
-        prediction = classifier_model.predict(input_image)[0][0]
+        prediction = classifier_model.predict(input_image, verbose=0)[0][0]
         is_face_human = bool(prediction >= 0.5)
-        
     return face_count, is_face_human
 
 print("Helper function 'detect_and_classify_face' defined.")
 
 # --- OCR KTP Indonesia ---
-def _to_gray_and_resize(image_np, min_width=800):
-    """Grayscale + resize jika terlalu kecil."""
+def _to_gray_and_resize(image_np, min_width=800, max_width=1200):
+    """Grayscale + resize: perbesar jika terlalu kecil, perkecil jika terlalu besar (ringankan CPU)."""
     if len(image_np.shape) == 3:
         gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
     else:
@@ -92,6 +102,9 @@ def _to_gray_and_resize(image_np, min_width=800):
     if w < min_width:
         scale = min_width / w
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    elif w > max_width:
+        scale = max_width / w
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     return gray
 
 
@@ -117,40 +130,64 @@ def _preprocess_variants(gray):
     return variants
 
 
+def _ocr_score(text):
+    """Skor kualitas teks OCR KTP (NIK 16 digit = sangat bagus)."""
+    if not text:
+        return -1
+    score = 0
+    if re.search(r"\d{16}", re.sub(r"\s", "", text)):
+        score += 100
+    score += min(50, len(re.findall(r"\d{10,}", text)) * 10)
+    score += min(30, text.count(" ") * 2)
+    if "NIK" in text or "Nama" in text or "Alamat" in text:
+        score += 20
+    return score
+
+
+# Skor minimal agar OCR berhenti lebih awal (ringankan CPU)
+_OCR_GOOD_ENOUGH_SCORE = 100
+
+def _run_tesseract_once(img, lang="ind+eng", psm=6):
+    """Satu kali panggilan Tesseract (untuk kurangi duplikasi)."""
+    try:
+        return pytesseract.image_to_string(img, lang=lang, config=f"--psm {psm}")
+    except Exception:
+        try:
+            return pytesseract.image_to_string(img, lang="eng", config=f"--psm {psm}")
+        except Exception:
+            return None
+
+
 def ocr_ktp_image(image_np):
-    """Jalankan OCR pada gambar; coba beberapa preprocessing & PSM, pilih hasil terbaik."""
+    """Jalankan OCR pada gambar; coba 1 kombinasi dulu, baru loop jika perlu (ringankan CPU)."""
     if not OCR_AVAILABLE:
         return None, "OCR tidak tersedia. Install: pip install pytesseract dan pasang Tesseract (tesseract-ocr, tesseract-ocr-ind)."
     gray = _to_gray_and_resize(image_np)
     variants = _preprocess_variants(gray)
-    psms = [6, 4, 13]  # 6=block, 4=column, 13=raw line
+    # Coba sekali dulu (gray + PSM 6) - sering cukup untuk KTP jelas
     best_text = ""
     best_score = -1
+    quick_img = variants[-1][1]  # "gray"
+    quick_text = ( _run_tesseract_once(quick_img, psm=6) or "" ).strip()
+    if quick_text:
+        best_score = _ocr_score(quick_text)
+        best_text = quick_text
+        if best_score >= _OCR_GOOD_ENOUGH_SCORE:
+            return best_text, None
+    psms = [6, 4, 13]
     for name, img in variants:
         for psm in psms:
-            try:
-                text = pytesseract.image_to_string(
-                    img, lang="ind+eng", config=f"--psm {psm}"
-                )
-            except Exception:
-                try:
-                    text = pytesseract.image_to_string(img, lang="eng", config=f"--psm {psm}")
-                except Exception:
-                    continue
-            text = (text or "").strip()
+            if name == "gray" and psm == 6:
+                continue
+            text = ( _run_tesseract_once(img, psm=psm) or "" ).strip()
             if not text:
                 continue
-            # Skor: ada NIK (16 digit) = sangat bagus; banyak digit/huruf = bagus
-            score = 0
-            if re.search(r"\d{16}", re.sub(r"\s", "", text)):
-                score += 100
-            score += min(50, len(re.findall(r"\d{10,}", text)) * 10)
-            score += min(30, text.count(" ") * 2)
-            if "NIK" in text or "Nama" in text or "Alamat" in text:
-                score += 20
+            score = _ocr_score(text)
             if score > best_score:
                 best_score = score
                 best_text = text
+                if best_score >= _OCR_GOOD_ENOUGH_SCORE:
+                    return best_text, None
     if not best_text:
         # Cek apakah Tesseract benar-benar ada (di server PATH terbatas bisa tidak ketemu)
         try:
@@ -476,6 +513,9 @@ def parse_ktp_fields(ocr_text):
 
 print("OCR KTP helpers defined." if OCR_AVAILABLE else "OCR KTP skipped (pytesseract not available).")
 
+# Batasi request berat bersamaan (ringankan CPU)
+_HEAVY_SEMAPHORE = asyncio.Semaphore(2)
+
 # 5. Initialize FastAPI application
 app = FastAPI()
 print("FastAPI app initialized.")
@@ -483,14 +523,15 @@ print("FastAPI app initialized.")
 # 6. Define a POST endpoint
 @app.post("/validate-face/")
 async def predict_face(file: UploadFile = File(...)):
-    contents = await file.read()
-    np_img = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    async with _HEAVY_SEMAPHORE:
+        contents = await file.read()
+        np_img = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
 
-    if img is None:
-        return {"success": False, "message": "Could not decode image.", "is_human": None, "face_found": False}
+        if img is None:
+            return {"success": False, "message": "Could not decode image.", "is_human": None, "face_found": False}
 
-    face_count, is_face_human_result = detect_and_classify_face(img, face_cascade, model, IMG_HEIGHT, IMG_WIDTH)
+        face_count, is_face_human_result = detect_and_classify_face(img, face_cascade, model, IMG_HEIGHT, IMG_WIDTH)
 
     success = False
     is_human_label = None
@@ -518,46 +559,47 @@ async def get_pekerjaan_options():
 @app.post("/ocr-ktp/")
 async def ocr_ktp(file: UploadFile = File(...)):
     """OCR untuk KTP Indonesia. Upload gambar KTP, dapatkan teks dan field terstruktur."""
-    contents = await file.read()
-    np_img = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    async with _HEAVY_SEMAPHORE:
+        contents = await file.read()
+        np_img = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
 
-    if img is None:
+        if img is None:
+            return {
+                "success": False,
+                "message": "Could not decode image.",
+                "raw_text": None,
+                "fields": {}
+            }
+
+        raw_text, err = ocr_ktp_image(img)
+        if err:
+            return {
+                "success": False,
+                "message": err,
+                "raw_text": None,
+                "fields": {}
+            }
+
+        fields = parse_ktp_fields(raw_text)
+        # Pastikan semua key standar ada (nilai None jika tidak terdeteksi)
+        out = {k: None for k in KTP_FIELD_KEYS}
+        out.update({k: v for k, v in fields.items() if k in out and v})
+        fields_read = sum(1 for v in out.values() if v is not None)
+        if fields_read == 0:
+            message = (
+                "Teks KTP tidak terbaca. Pastikan: (1) foto KTP jelas dan tidak blur, "
+                "(2) seluruh area KTP terlihat, (3) pencahayaan cukup. Coba foto ulang dengan KTP rata dan fokus."
+            )
+        else:
+            message = "OCR selesai."
         return {
-            "success": False,
-            "message": "Could not decode image.",
-            "raw_text": None,
-            "fields": {}
+            "success": True,
+            "message": message,
+            "raw_text": raw_text,
+            "fields": out,
+            "fields_read": fields_read,
         }
-
-    raw_text, err = ocr_ktp_image(img)
-    if err:
-        return {
-            "success": False,
-            "message": err,
-            "raw_text": None,
-            "fields": {}
-        }
-
-    fields = parse_ktp_fields(raw_text)
-    # Pastikan semua key standar ada (nilai None jika tidak terdeteksi)
-    out = {k: None for k in KTP_FIELD_KEYS}
-    out.update({k: v for k, v in fields.items() if k in out and v})
-    fields_read = sum(1 for v in out.values() if v is not None)
-    if fields_read == 0:
-        message = (
-            "Teks KTP tidak terbaca. Pastikan: (1) foto KTP jelas dan tidak blur, "
-            "(2) seluruh area KTP terlihat, (3) pencahayaan cukup. Coba foto ulang dengan KTP rata dan fokus."
-        )
-    else:
-        message = "OCR selesai."
-    return {
-        "success": True,
-        "message": message,
-        "raw_text": raw_text,
-        "fields": out,
-        "fields_read": fields_read,
-    }
 
 
 print("FastAPI endpoint '/validate-face/' and '/ocr-ktp/' defined.")
