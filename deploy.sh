@@ -107,6 +107,12 @@ Type=simple
 User=$APP_USER
 WorkingDirectory=$TARGET_DIR
 Environment="PATH=$TARGET_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+# Batasi thread agar CPU tidak 100% (sesuai validate.py)
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=TF_NUM_INTRAOP_THREADS=1
+Environment=TF_NUM_INTEROP_THREADS=1
 ExecStart=$TARGET_DIR/.venv/bin/uvicorn validate:app --host 0.0.0.0 --port $PORT
 Restart=on-failure
 RestartSec=5
@@ -138,9 +144,9 @@ echo ""
 echo "=========================================="
 echo "  Deploy selesai."
 echo "=========================================="
-echo "Jalankan aplikasi:"
+echo "Jalankan aplikasi (untuk CPU ringan, jangan pakai --workers):"
 echo "  cd $TARGET_DIR && source .venv/bin/activate"
-echo "  uvicorn validate:app --host 0.0.0.0 --port $PORT"
+echo "  OMP_NUM_THREADS=1 uvicorn validate:app --host 0.0.0.0 --port $PORT"
 echo ""
 echo "Atau dengan systemd:"
 echo "  sudo systemctl start face-api"
