@@ -282,7 +282,7 @@ def _clean_ktp_value(raw: str, field_key: str) -> str:
         return ""
     s = " ".join(raw.split())
     s = s.strip(" '\"\\|;*")
-    s = re.sub(r"^[\s\|:\-\"\'<>!*\\\.]+", "", s)
+    s = re.sub(r"^[\s\|:\-\"\'<>!*\\\.=]+", "", s)
     s = re.sub(r"Content\s*\*.*$", "", s, flags=re.I).strip()
     s = re.sub(r"\\\s*[a-z]{1,3}\s*$", "", s).strip()
     s = re.sub(r"\s+[a-z]\s*$", "", s).strip()
@@ -315,9 +315,14 @@ def _clean_ktp_value(raw: str, field_key: str) -> str:
         if m:
             return m.group(1).upper()
     if field_key == "berlaku_hingga":
+        # Cari tanggal lengkap DD-MM-YYYY atau DD/MM/YYYY dulu
         m = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4})", s)
         if m:
             return m.group(1)
+        # Tanggal tanpa pemisah jelas: DD-MM-YY atau 01-07-2017 dengan noise
+        m = re.search(r"(\d{2})\s*[-/]\s*(\d{2})\s*[-/]\s*(\d{4})", s)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
         # Tahun 19xx/20xx (bukan digit acak seperti 2210)
         for m in re.finditer(r"\b(19\d{2}|20\d{2})\b", s):
             return m.group(1)
@@ -372,11 +377,21 @@ def _clean_ktp_value(raw: str, field_key: str) -> str:
         s = re.sub(r"^[\"'\s<>!0-9\(\)]+\s*", "", s).strip()
         s = re.sub(r"\s+Te\s+ea\s+ea\s+nb\s*$", "", s, flags=re.I).strip()
         s = re.sub(r"\s*\(\s*H\d\s*$", "", s).strip()
-    # RT/RW: format 000/000
+    # RT/RW: format 000/000 (OCR sering baca "/" sebagai "1" -> "008 1004" = 008/004)
     if field_key == "rt_rw":
         m = re.search(r"\d{3}\s*/\s*\d{3}", s)
         if m:
             s = m.group(0)
+        else:
+            # Pola "008 1004" (slash terbaca 1) -> 008/004
+            m = re.search(r"(\d{3})\s+1\s*(\d{3})", s)
+            if m:
+                s = f"{m.group(1)}/{m.group(2)}"
+            else:
+                # "008 004" atau "008  004" -> 008/004
+                m = re.search(r"(\d{3})\s+(\d{3})", s)
+                if m:
+                    s = f"{m.group(1)}/{m.group(2)}"
     # Kel/Desa: satu kata (nama kelurahan)
     if field_key == "kel_desa":
         s = re.sub(r"^[_\s:\.\-]+\s*", "", s).strip()
@@ -398,10 +413,14 @@ def parse_ktp_fields(ocr_text):
     result = {}
     if not ocr_text:
         return result
-    # NIK pasti 16 digit
-    nik_match = re.search(r"\d{16}", re.sub(r"\s", "", ocr_text))
-    if nik_match:
-        result["nik"] = nik_match.group(0)
+    # NIK pasti 16 digit (kadang ":" terbaca "1" -> "1 3271053010020008", jangan ambil 16 digit pertama)
+    digits_only = re.sub(r"\D", "", ocr_text)
+    if len(digits_only) >= 16:
+        if len(digits_only) == 17 and digits_only[0] == "1":
+            # "1" kemungkinan salah baca ":" -> ambil 16 digit setelahnya
+            result["nik"] = digits_only[1:17]
+        else:
+            result["nik"] = digits_only[:16]
 
     # Cari semua posisi label (pattern, key, start, end)
     matches = []
